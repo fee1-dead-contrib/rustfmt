@@ -21,6 +21,7 @@ use crate::expr::{
     rewrite_assign_rhs_with, rewrite_assign_rhs_with_comments, rewrite_else_kw_with_comments,
     rewrite_let_else_block,
 };
+use crate::header::{format_header, HeaderPart};
 use crate::lists::{ListFormatting, Separator, definitive_tactic, itemize_list, write_list};
 use crate::macros::{MacroPosition, rewrite_macro};
 use crate::overflow;
@@ -502,14 +503,60 @@ impl<'a> FmtVisitor<'a> {
         self.push_rewrite(static_parts.span, rewrite);
     }
 
-    pub(crate) fn visit_struct(&mut self, struct_parts: &StructParts<'_>) {
-        let is_tuple = match struct_parts.def {
-            ast::VariantData::Tuple(..) => true,
-            _ => false,
+    pub(crate) fn rewrite_struct(&mut self, item: &ast::Item, vd: &ast::VariantData, generics: &ast::Generics) -> Option<String> {
+        let context = self.get_context();
+        let header = vec![
+            HeaderPart::visibility(&context, &item.vis),
+            HeaderPart::keyword(&context, "struct", item.vis.span.between(item.ident.span)),
+            HeaderPart::ident(&context, item.ident)
+        ];
+        let mut result = format_header(&context, self.shape(), header);
+
+        let mut do_generics = |body_lo| {
+            let generics_str = format_generics(
+                &context,
+                generics,
+                context.config.brace_style(),
+                if vd.fields().is_empty() {
+                    BracePos::ForceSameLine
+                } else {
+                    BracePos::Auto
+                },
+                self.block_indent,
+                // make a span that starts right after `struct Foo`
+                mk_sp(item.ident.span.hi(), body_lo),
+                last_line_width(&result),
+            )?;
+            result.push_str(&generics_str);
+            Some(())
         };
-        let rewrite = format_struct(&self.get_context(), struct_parts, self.block_indent, None)
-            .map(|s| if is_tuple { s + ";" } else { s });
-        self.push_rewrite(struct_parts.span, rewrite);
+
+        match vd {
+            ast::VariantData::Tuple(fields, _) => {
+                let hi = generics.where_clause.span.shrink_to_lo();
+                let body_span = item.ident.span.shrink_to_lo().to(hi);
+                let body_lo = self.snippet_provider.span_before(body_span, "(");
+                let body_hi = self.snippet_provider.span_after_last(body_span, ")");
+                let body_span = mk_sp(body_lo, body_hi);
+                do_generics(body_lo)?;
+                format_tuple_data(&context, &mut result, fields, body_span, self.block_indent)?;
+            }
+            ast::VariantData::Struct { fields, recovered: _ } => {
+                let lo = generics.where_clause.span.shrink_to_hi();
+                let body_span = lo.to(item.span.shrink_to_hi());
+                let body_lo = self.snippet_provider.span_before(body_span, "{");
+                let body_span = mk_sp(body_lo, body_span.hi());
+                do_generics(body_lo)?;
+                format_struct_data(&context, &mut result, fields, body_span, self.block_indent, None)?;
+            }
+            ast::VariantData::Unit(_) => {
+                // FIXME(new) are generics here?
+            }
+        }
+        if matches!(vd, ast::VariantData::Tuple(..) | ast::VariantData::Unit(..)) {
+            result.push(';');
+        }
+        Some(result)
     }
 
     pub(crate) fn visit_enum(
@@ -520,8 +567,13 @@ impl<'a> FmtVisitor<'a> {
         generics: &ast::Generics,
         span: Span,
     ) {
-        let enum_header =
-            format_header(&self.get_context(), "enum ", ident, vis, self.block_indent);
+        let context = self.get_context();
+        let header = vec![
+            HeaderPart::visibility(&context, vis),
+            HeaderPart::keyword(&context, "enum", vis.span.between(ident.span)),
+            HeaderPart::ident(&context, ident),
+        ];
+        let enum_header = crate::header::format_header(&context, self.shape(), header);
         self.push_str(&enum_header);
 
         let enum_snippet = self.snippet(span);
@@ -645,40 +697,51 @@ impl<'a> FmtVisitor<'a> {
     // Variant of an enum.
     fn format_variant(
         &self,
-        field: &ast::Variant,
+        v: &ast::Variant,
         one_line_width: usize,
         pad_discrim_ident_to: usize,
     ) -> Option<String> {
-        if contains_skip(&field.attrs) {
-            let lo = field.attrs[0].span.lo();
-            let span = mk_sp(lo, field.span.hi());
+        if contains_skip(&v.attrs) {
+            let lo = v.attrs[0].span.lo();
+            let span = mk_sp(lo, v.span.hi());
             return Some(self.snippet(span).to_owned());
         }
 
         let context = self.get_context();
         let shape = self.shape();
-        let attrs_str = field.attrs.rewrite(&context, shape)?;
+        let attrs_str = v.attrs.rewrite(&context, shape)?;
         // sub_width(1) to take the trailing comma into account
         let shape = shape.sub_width_opt(1)?;
 
-        let lo = field
+        let lo = v
             .attrs
             .last()
-            .map_or(field.span.lo(), |attr| attr.span.hi());
-        let span = mk_sp(lo, field.span.lo());
+            .map_or(v.span.lo(), |attr| attr.span.hi());
+        let span = mk_sp(lo, v.span.lo());
 
-        let variant_body = match field.data {
-            ast::VariantData::Tuple(..) | ast::VariantData::Struct { .. } => format_struct(
-                &context,
-                &StructParts::from_variant(field, &context),
-                self.block_indent,
-                Some(one_line_width),
-            )?,
-            ast::VariantData::Unit(..) => rewrite_ident(&context, field.ident).to_owned(),
+        let mut result = format!("{}", rewrite_ident(&context, v.ident));
+
+        let delim = match v.data {
+            // FIXME(new) change to char
+            ast::VariantData::Tuple(..) => Some("("),
+            ast::VariantData::Struct { .. } => Some("{"),
+            ast::VariantData::Unit(..) => None,
         };
 
-        let variant_body = if let Some(ref expr) = field.disr_expr {
-            let lhs = format!("{variant_body:pad_discrim_ident_to$} =");
+        if let Some(delim) = delim {
+            let data_span = v.ident.span.shrink_to_hi().to(v.span.shrink_to_hi());
+            let data_lo = self.snippet_provider.span_before(data_span, delim);
+            let data_span = data_span.with_lo(data_lo);
+            if delim == "(" {
+                format_tuple_data(&context, &mut result, v.data.fields(), data_span, self.block_indent)?;
+            } else {
+                // FIXME(new) handle spacing between ident and brace
+                format_struct_data(&context, &mut result, v.data.fields(), data_span, self.block_indent, Some(one_line_width))?;
+            }
+        }
+
+        let variant_body = if let Some(ref expr) = v.disr_expr {
+            let lhs = format!("{result:pad_discrim_ident_to$} =");
             let ex = &*expr.value;
             rewrite_assign_rhs_with(
                 &context,
@@ -690,7 +753,7 @@ impl<'a> FmtVisitor<'a> {
             )
             .ok()?
         } else {
-            variant_body
+            result
         };
 
         combine_strs_with_missing_comments(&context, &attrs_str, &variant_body, span, shape, false)
@@ -1046,43 +1109,41 @@ fn rewrite_trait_ref(
 }
 
 pub(crate) struct StructParts<'a> {
-    prefix: &'a str,
-    ident: symbol::Ident,
-    vis: &'a ast::Visibility,
+    header: Vec<HeaderPart>,
     def: &'a ast::VariantData,
     generics: Option<&'a ast::Generics>,
     span: Span,
+    ident_hi: BytePos,
 }
 
 impl<'a> StructParts<'a> {
-    fn format_header(&self, context: &RewriteContext<'_>, offset: Indent) -> String {
-        format_header(context, self.prefix, self.ident, self.vis, offset)
-    }
-
-    fn from_variant(variant: &'a ast::Variant, context: &RewriteContext<'_>) -> Self {
+    fn from_variant(context: &RewriteContext<'_>, variant: &'a ast::Variant) -> Self {
         StructParts {
-            prefix: "",
-            ident: variant.ident,
-            vis: &DEFAULT_VISIBILITY,
+            header: vec![HeaderPart::ident(context, variant.ident)],
             def: &variant.data,
             generics: None,
             span: enum_variant_span(variant, context),
+            ident_hi: variant.ident.span.hi(), 
         }
     }
 
-    pub(crate) fn from_item(item: &'a ast::Item) -> Self {
-        let (prefix, def, generics) = match item.kind {
-            ast::ItemKind::Struct(ref def, ref generics) => ("struct ", def, generics),
-            ast::ItemKind::Union(ref def, ref generics) => ("union ", def, generics),
+    pub(crate) fn from_item(context: &RewriteContext<'_>, item: &'a ast::Item) -> Self {
+        let (keyword, def, generics) = match item.kind {
+            ast::ItemKind::Struct(ref def, ref generics) => ("struct", def, generics),
+            ast::ItemKind::Union(ref def, ref generics) => ("union", def, generics),
             _ => unreachable!(),
         };
+        let header = vec![
+            HeaderPart::visibility(context, &item.vis),
+            HeaderPart::keyword(context, keyword, item.vis.span.between(item.ident.span)),
+            HeaderPart::ident(context, item.ident)
+        ];
         StructParts {
-            prefix,
-            ident: item.ident,
-            vis: &item.vis,
+            header,
             def,
             generics: Some(generics),
             span: item.span,
+            ident_hi: item.ident.span.hi()
         }
     }
 }
@@ -1106,22 +1167,6 @@ fn enum_variant_span(variant: &ast::Variant, context: &RewriteContext<'_>) -> Sp
     }
 }
 
-fn format_struct(
-    context: &RewriteContext<'_>,
-    struct_parts: &StructParts<'_>,
-    offset: Indent,
-    one_line_width: Option<usize>,
-) -> Option<String> {
-    match struct_parts.def {
-        ast::VariantData::Unit(..) => format_unit_struct(context, struct_parts, offset),
-        ast::VariantData::Tuple(fields, _) => {
-            format_tuple_struct(context, struct_parts, fields, offset)
-        }
-        ast::VariantData::Struct { fields, .. } => {
-            format_struct_struct(context, struct_parts, fields, offset, one_line_width)
-        }
-    }
-}
 
 pub(crate) fn format_trait(
     context: &RewriteContext<'_>,
@@ -1375,10 +1420,11 @@ pub(crate) fn format_trait_alias(
 
 fn format_unit_struct(
     context: &RewriteContext<'_>,
-    p: &StructParts<'_>,
+    p: StructParts<'_>,
     offset: Indent,
+    shape: Shape,
 ) -> Option<String> {
-    let header_str = format_header(context, p.prefix, p.ident, p.vis, offset);
+    let header_str = crate::header::format_header(context, shape, p.header);
     let generics_str = if let Some(generics) = p.generics {
         let hi = context.snippet_provider.span_before_last(p.span, ";");
         format_generics(
@@ -1544,16 +1590,84 @@ fn format_empty_struct_or_tuple(
     result.push_str(closer);
 }
 
+/// `body_span` is the `Span` starting with `(` and ends with `)`.
+#[must_use]
+fn format_tuple_data(context: &RewriteContext<'_>, result: &mut String, fields: &[ast::FieldDef], body_span: Span, offset: Indent) -> Option<()> {
+    if fields.is_empty() {
+        format_empty_struct_or_tuple(context, body_span, offset, result, "(", ")");
+    } else {
+        // FIXME(new) propagate an error here instead of option
+        let shape = Shape::indented(offset, context.config).sub_width_opt(1)?;
+        result.push_str(&overflow::rewrite_with_parens(
+            context,
+            result,
+            fields.iter(),
+            shape,
+            body_span,
+            context.config.fn_call_width(),
+            None,
+        ).ok()?);
+    }
+    Some(())
+}
+
+/// `body_span` is the `Span` starting with `{` and ends with `}`.
+///
+/// `result` is a string for the current rewrite ending with the name of the struct.
+/// This function will decide whether to start a newline or put a space before the body starts.
+#[must_use]
+fn format_struct_data(context: &RewriteContext<'_>, result: &mut String, fields: &[ast::FieldDef], body_span: Span, offset: Indent, one_line_width: Option<usize>) -> Option<()> {
+    if fields.is_empty() {
+        format_empty_struct_or_tuple(context, body_span, offset, result, "{", "}");
+        return Some(());
+    }
+
+    result.push('{');
+
+    // 3 = ` ` and ` }`
+    let one_line_budget = context.budget(result.len() + 3 + offset.width());
+    let one_line_budget =
+        one_line_width.map_or(0, |one_line_width| min(one_line_width, one_line_budget));
+
+    let items_str = rewrite_with_alignment(
+        fields,
+        context,
+        Shape::indented(offset.block_indent(context.config), context.config).sub_width_opt(1)?,
+        body_span,
+        one_line_budget,
+    )?;
+
+    if !items_str.contains('\n')
+        && !result.contains('\n')
+        && items_str.len() <= one_line_budget
+        && !last_line_contains_single_line_comment(&items_str)
+    {
+        result.push_str(&format!(" {items_str} }}"));
+    } else {
+        result.push_str(&format!(
+            "\n{}{}\n{}}}",
+            offset
+                .block_indent(context.config)
+                .to_string(context.config),
+            items_str,
+            offset.to_string(context.config)
+        ));
+    }
+    Some(())
+}
+
 fn format_tuple_struct(
     context: &RewriteContext<'_>,
-    struct_parts: &StructParts<'_>,
+    struct_parts: StructParts<'_>,
     fields: &[ast::FieldDef],
     offset: Indent,
+    shape: Shape,
 ) -> Option<String> {
     let mut result = String::with_capacity(1024);
     let span = struct_parts.span;
 
-    let header_str = struct_parts.format_header(context, offset);
+    // FIXME(new) remove the `crate::header` prefix
+    let header_str = crate::header::format_header(context, shape, struct_parts.header);
     result.push_str(&header_str);
 
     let body_lo = if fields.is_empty() {
@@ -2922,7 +3036,7 @@ fn newline_for_brace(config: &Config, where_clause: &ast::WhereClause) -> FnBrac
     }
 }
 
-fn rewrite_generics(
+pub(crate) fn rewrite_generics(
     context: &RewriteContext<'_>,
     ident: &str,
     generics: &ast::Generics,
@@ -3217,47 +3331,16 @@ fn rewrite_comments_before_after_where(
     Ok((before_comment, after_comment))
 }
 
-fn format_header(
-    context: &RewriteContext<'_>,
-    item_name: &str,
-    ident: symbol::Ident,
-    vis: &ast::Visibility,
-    offset: Indent,
-) -> String {
-    let mut result = String::with_capacity(128);
-    let shape = Shape::indented(offset, context.config);
-
-    result.push_str(format_visibility(context, vis).trim());
-
-    // Check for a missing comment between the visibility and the item name.
-    let after_vis = vis.span.hi();
-    if let Some(before_item_name) = context
-        .snippet_provider
-        .opt_span_before(mk_sp(vis.span.lo(), ident.span.hi()), item_name.trim())
-    {
-        let missing_span = mk_sp(after_vis, before_item_name);
-        if let Ok(result_with_comment) = combine_strs_with_missing_comments(
-            context,
-            &result,
-            item_name,
-            missing_span,
-            shape,
-            /* allow_extend */ true,
-        ) {
-            result = result_with_comment;
-        }
-    }
-
-    result.push_str(rewrite_ident(context, ident));
-
-    result
-}
-
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum BracePos {
     None,
     Auto,
     ForceSameLine,
+}
+
+/// Given the current string `pub struct Foo<T>` or `pub struct Foo<T>(T)`, append the where clause into the result. 
+fn format_where_clauses() {
+
 }
 
 fn format_generics(

@@ -1124,6 +1124,7 @@ pub(crate) trait FindUncommented {
 }
 
 impl FindUncommented for str {
+    // FIXME(new): allow pat to be char
     fn find_uncommented(&self, pat: &str) -> Option<usize> {
         let mut needle_iter = pat.chars();
         for (kind, (i, b)) in CharClasses::new(self.char_indices()) {

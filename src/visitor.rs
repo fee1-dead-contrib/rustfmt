@@ -10,9 +10,9 @@ use crate::attr::*;
 use crate::comment::{CodeCharKind, CommentCodeSlices, contains_comment, rewrite_comment};
 use crate::config::{BraceStyle, Config, MacroSelector};
 use crate::coverage::transform_missing_snippet;
+use crate::header::{format_header, HeaderPart};
 use crate::items::{
-    FnBraceStyle, FnSig, ItemVisitorKind, StaticParts, StructParts, format_impl, format_trait,
-    format_trait_alias, is_mod_decl, is_use_item, rewrite_extern_crate, rewrite_type_alias,
+    format_impl, format_trait, format_trait_alias, is_mod_decl, is_use_item, rewrite_extern_crate, rewrite_generics, rewrite_type_alias, FnBraceStyle, FnSig, ItemVisitorKind, StaticParts, StructParts
 };
 use crate::macros::{MacroPosition, macro_style, rewrite_macro, rewrite_macro_def};
 use crate::modules::Module;
@@ -509,8 +509,15 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
                     };
                     self.push_rewrite(span, rw.ok());
                 }
+                ast::ItemKind::Struct(vd, generics) => {
+                    let s = self.rewrite_struct(item, &vd, &generics);
+                    // FIXME(new) spans with attributes?
+                    self.push_rewrite(item.span, s);
+                }
                 ast::ItemKind::Struct(..) | ast::ItemKind::Union(..) => {
-                    self.visit_struct(&StructParts::from_item(item));
+                    // FIXME(new) store a single context instead of getting them everywhere
+                    
+                    self.visit_struct(StructParts::from_item(&self.get_context(), item));
                 }
                 ast::ItemKind::Enum(ref def, ref generics) => {
                     self.format_missing_with_indent(source!(self, item.span).lo());
